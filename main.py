@@ -149,9 +149,13 @@ def get_likes():
             print(f"Problematic content: {result.content}")
             return
 
+        if "items" not in json_result:
+            print("Unexpected response format. Unable to retrieve liked tracks.")
+            return
+
         total_items = json_result.get("total", 0)
 
-        for item in json_result.get("items", []):
+        for item in json_result["items"]:
             track_id = item.get("track", {}).get("id")
             track_name = item.get("track", {}).get("name")
             artist_name = item.get("track", {}).get("artists", [{}])[0].get("name")

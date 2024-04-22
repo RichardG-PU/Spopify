@@ -6,6 +6,9 @@ import json
 import random
 import string
 from urllib.parse import urlencode
+from sklearn.cluster import KMeans
+import numpy as np
+import time
 
 app = Flask(__name__)
 
@@ -17,6 +20,9 @@ token = None
 data_folder = "data"
 json_filename = "likes.json"
 dupes_filename = "dupes.json"
+clusters_filename = "clusters.json"
+
+likes_data = []
 
 if not os.path.exists(data_folder):
     os.makedirs(data_folder)
@@ -32,6 +38,7 @@ def get_auth_header(token):
 
 
 def add_tracks_to_playlist(playlist_id, tracks):
+    print(tracks)
     global token
     if token is None:
         print("Token is not available. Please authorize first.")
@@ -130,8 +137,6 @@ def get_likes():
     offset = 0
     total_items = float("inf")
 
-    likes_data = []
-
     while offset < total_items:
         params = {"offset": offset, "limit": limit}
 
@@ -161,6 +166,9 @@ def get_likes():
 
         offset += limit
 
+    track_ids = [item["track_id"] for item in likes_data]
+    get_audio_features(track_ids)
+
     json_filepath = os.path.join(data_folder, json_filename)
     with open(json_filepath, "w") as json_file:
         json.dump(likes_data, json_file, indent=2)
@@ -177,6 +185,65 @@ def get_likes():
     print(f"Duplicates saved to {dupes_filepath}")
 
     return likes_data
+
+def get_audio_features(track_ids):
+    while track_ids:
+        url = "https://api.spotify.com/v1/audio-features"
+        headers = get_auth_header(token)
+        params = {"ids": ",".join(track_ids[:100])}
+        print(params)
+        response = get(url, headers=headers, params=params)
+        if response.status_code == 200:
+            audio_features_data = json.loads(response.content)
+            audio_features_list = audio_features_data["audio_features"]
+            for audio_features in audio_features_list:
+                features_to_store = {
+                    "danceability": audio_features["danceability"],
+                    "energy": audio_features["energy"],
+                    "instrumentalness": audio_features["instrumentalness"],
+                    "acousticness": audio_features["acousticness"],
+                    "valence": audio_features["valence"],
+                    "tempo": audio_features["tempo"],
+                    "key": audio_features["key"]
+                }
+                for item in likes_data:
+                    if item["track_id"] == audio_features["id"]:
+                        item["audio_features"] = features_to_store
+            track_ids = track_ids[100:]
+        elif response.status_code == 429:
+            retry_after = response.headers.get('Retry-After')
+            if retry_after:
+                retry_after_seconds = int(retry_after)
+                print(f"Rate limit exceeded. Continuing after {retry_after_seconds} seconds...")
+                time.sleep(retry_after_seconds)
+            else:
+                print("Rate limit exceeded. Performing retry in 600 seconds...")
+                time.sleep(600)
+        else:
+            print(f"Failed to get audio features for tracks {track_ids}. Status Code: {response.status_code}")
+            return None
+
+
+def cluster_songs(songs_data):
+    audio_features = np.array([list(song["audio_features"].values()) for song in songs_data])
+    optimal_k = determine_optimal_k(audio_features)
+    kmeans = KMeans(n_clusters=optimal_k, init='k-means++', random_state=42)
+    clusters = kmeans.fit_predict(audio_features)
+    clustered_songs = {i: [] for i in range(optimal_k)}
+    for i, cluster_id in enumerate(clusters):
+        clustered_songs[cluster_id].append(songs_data[i])
+    return clustered_songs
+
+
+def determine_optimal_k(data):
+    distortions = []
+    max_clusters = 25
+    for k in range(1, max_clusters + 1):
+        kmeans = KMeans(n_clusters=k, init='k-means++', random_state=42)
+        kmeans.fit(data)
+        distortions.append(kmeans.inertia_)
+    optimal_k = distortions.index(min(distortions)) + 1
+    return optimal_k
 
 
 @app.route("/login")
@@ -233,18 +300,43 @@ def callback():
         token_response = json.loads(response.text)
         token = token_response.get("access_token")
 
-        likes_data = get_likes()
+        return "Token received successfully. You can now close this window."
 
-        playlist_name = "My Liked Tracks"
-        playlist_description = "A playlist containing my liked tracks on Spotify"
-        is_public = True
 
-        playlist_id = create_playlist(playlist_name, playlist_description, is_public)
+@app.route("/cluster")
+def store_clusters():
+    global likes_data
+    likes_data = load_likes_data()
 
-        if playlist_id:
-            add_tracks_to_playlist(playlist_id, likes_data)
+    if not likes_data:
+        return "No likes data available. Please authorize and fetch likes first."
 
-        return "Token received successfully. Playlist created and tracks added. You can now close this window."
+    clustered_songs = cluster_songs(likes_data)
+    
+    clusters_filepath = os.path.join(data_folder, clusters_filename)
+    with open(clusters_filepath, "w") as clusters_file:
+        json.dump(clustered_songs, clusters_file, indent=2)
+    return f"Clusters saved to {clusters_filepath}"
+
+def load_likes_data():
+    json_filepath = os.path.join(data_folder, json_filename)
+    if os.path.exists(json_filepath):
+        with open(json_filepath, "r") as json_file:
+            return json.load(json_file)
+    else:
+        return None
+
+
+@app.route("/playlist-maka")
+def create_playlists():
+    with open("data/clusters.json", "r") as file:
+        data = json.load(file)
+    
+    iteration = 0
+    for cluster_data in data.values():
+        playlist_id = create_playlist(str(iteration), "", True)
+        add_tracks_to_playlist(playlist_id, cluster_data)
+        iteration += 1
 
 
 if __name__ == "__main__":
